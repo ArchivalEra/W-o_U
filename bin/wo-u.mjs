@@ -26,7 +26,132 @@ import { fileURLToPath } from "node:url";
 const KIMI_HOME = process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code");
 const STORE_DIR = process.env.WO_U_DIR || process.env.KIMI_MESSENGER_DIR || path.join(os.homedir(), ".kimi-messenger");
 const STORE_FILE = path.join(STORE_DIR, "directory.db");
-const API_BASE = process.env.WO_U_API || process.env.KIMI_MESSENGER_API || "http://127.0.0.1:45589";
+
+/**
+ * Host API base URL.
+ *
+ * Kimi Code Desktop binds a random loopback port each launch, so a hardcoded
+ * port cannot survive a reboot. Discovery order:
+ *   1. explicit override (WO_U_API / KIMI_MESSENGER_API)
+ *   2. port recorded by the last known-good call (~/.wo-u/api.json)
+ *   3. probe: every loopback port owned by the kimi-code process, verified
+ *      against /api/v1/sessions; the winner is cached for next time.
+ */
+const API_OVERRIDE = process.env.WO_U_API || process.env.KIMI_MESSENGER_API || null;
+const DISCOVERY_CACHE = path.join(
+  process.env.WO_U_DIR || process.env.KIMI_MESSENGER_DIR || path.join(os.homedir(), ".kimi-messenger"),
+  "api.json",
+);
+
+function readCachedBase() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DISCOVERY_CACHE, "utf-8"));
+    if (typeof raw?.base === "string" && raw.base.startsWith("http://127.0.0.1:")) return raw.base;
+  } catch {}
+  return null;
+}
+
+function writeCachedBase(base) {
+  try {
+    fs.mkdirSync(path.dirname(DISCOVERY_CACHE), { recursive: true });
+    fs.writeFileSync(DISCOVERY_CACHE, JSON.stringify({ base, updatedAt: new Date().toISOString() }));
+  } catch {}
+}
+
+function localKimiPorts() {
+  const ports = new Set();
+  let pids = [];
+  try {
+    pids = fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n));
+  } catch {
+    return ports;
+  }
+  for (const pid of pids) {
+    let cmdline = "";
+    try {
+      cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!cmdline.includes("kimi-code") || cmdline.includes("--type=")) continue;
+    try {
+      // Collect raw socket inode numbers owned by this process.
+      const inodeSet = new Set();
+      try {
+        for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+          const link = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+          const m = link.match(/^socket:\[(\d+)\]$/);
+          if (m?.[1]) inodeSet.add(m[1]);
+        }
+      } catch {}
+      if (inodeSet.size === 0) continue;
+
+      // Match against /proc/net/tcp and tcp6; both tables carry a header row
+      // and store the inode as a bare decimal in column 9.
+      for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+        let rows = [];
+        try {
+          rows = fs.readFileSync(table, "utf-8").split("\n");
+        } catch {
+          continue;
+        }
+        for (const line of rows) {
+          const cols = line.trim().split(/\s+/);
+          if (cols.length < 10 || !/^\d+$/.test(cols[9])) continue;
+          if (!inodeSet.has(cols[9])) continue;
+          const local = cols[1];
+          const m = local?.match(/^([0-9A-F]+):([0-9A-F]{4})$/);
+          if (!m?.[1] || !m[2]) continue;
+          // IPv4 addresses are hex-encoded little-endian inside tcp; tcp6
+          // entries may embed an IPv4 loopback as ::ffff:127.0.0.1.
+          const hex = m[1];
+          const isLoopback = hex.length === 8
+            ? hex.match(/../g)?.reverse().join("") === "7F000001"
+            : hex.toLowerCase().endsWith("7f000001");
+          if (!isLoopback) continue;
+          ports.add(parseInt(m[2], 16));
+        }
+      }
+    } catch {}
+  }
+  return ports;
+}
+
+let cachedApiBase = API_OVERRIDE;
+
+async function resolveApiBase() {
+  if (cachedApiBase) return cachedApiBase;
+
+  const cached = readCachedBase();
+  const candidates = [];
+  if (cached) candidates.push(cached);
+  for (const port of localKimiPorts()) candidates.push(`http://127.0.0.1:${port}`);
+  candidates.push("http://127.0.0.1:45589");
+
+  const seen = new Set();
+  for (const base of candidates) {
+    if (seen.has(base)) continue;
+    seen.add(base);
+    const token = apiToken();
+    if (!token) break;
+    try {
+      const res = await fetch(`${base}/api/v1/sessions`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(1500),
+      });
+      const body = await apiJson(res);
+      if (body?.code === 0 && Array.isArray(body?.data?.items)) {
+        writeCachedBase(base);
+        cachedApiBase = base;
+        return base;
+      }
+    } catch {}
+  }
+  // Nothing verified; fall back to the cached port or the historical default
+  // so callers get a coherent error instead of a malformed URL.
+  cachedApiBase = cached || "http://127.0.0.1:45589";
+  return cachedApiBase;
+}
 
 const PHONE = (process.env.WO_U_COMMAND || process.env.KIMI_MESSENGER_PHONE || "wo-u").trim();
 
@@ -63,10 +188,11 @@ async function apiJson(res) {
 }
 
 async function kimiApiGet(pathname) {
+  const base = await resolveApiBase();
   const token = apiToken();
   if (!token) return null;
   try {
-    const res = await fetch(`${API_BASE}${pathname}`, {
+    const res = await fetch(`${base}${pathname}`, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(3000),
     });
@@ -116,11 +242,12 @@ const KimiHostAdapter = {
   },
 
   async wake(sessionId, text) {
+    const base = await resolveApiBase();
     const token = apiToken();
     if (!token) return { ok: false, reason: "missing_token" };
 
     try {
-      const res = await fetch(`${API_BASE}/api/v1/sessions/${sessionId}/prompts`, {
+      const res = await fetch(`${base}/api/v1/sessions/${sessionId}/prompts`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ content: [{ type: "text", text }] }),
