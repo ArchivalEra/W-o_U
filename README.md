@@ -30,6 +30,17 @@ The recipient sees the message immediately upon waking. No extra `read` command 
 
 ---
 
+## Quick Install
+
+Requires Node.js >= 22.5.0:
+
+```bash
+git clone https://github.com/ArchivalEra/W-o_U.git ~/.wo-u/app
+ln -sf ~/.wo-u/app/bin/wo-u ~/.local/bin/wo-u
+```
+
+---
+
 ## Commands
 
 ```bash
