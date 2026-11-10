@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * W/o U (without User) — Direct messaging between AI agent sessions.
+ * W/o U (without User) — Direct session-level phone for AI agents.
  *
- * Single-file deep module:
- *   - Persistent SQLite store via Node's native node:sqlite (zero npm deps).
- *   - Dual cursors (notified_seq for incoming calls, last_seq for body reads).
- *   - Directory alias registry with strict collision rejection.
- *   - Pluggable host wake adapter (built-in Kimi Code HTTP prompt, custom command, or quiet).
- *   - Physical directory isolation (every directory is an independent phone).
- *   - Self-executable CLI entrypoint when run from command line.
+ * Minimalist architecture:
+ *   - Zero message storage: Messages are delivered directly into the recipient's
+ *     session context. The host agent transcript is the single source of truth.
+ *   - Only the Directory is stored: A tiny SQLite database mapping unique aliases
+ *     to session IDs. No cursors, no message logs, no state skew.
+ *   - Instant Wake: Direct delivery via Kimi Code HTTP API or custom wake command.
+ *   - Simple result: Sent successfully or failed.
  */
 
 import fs from "node:fs";
@@ -20,12 +20,12 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
-// Paths & Environment
+// Environment & Paths
 // ---------------------------------------------------------------------------
 
 const KIMI_HOME = process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code");
 const STORE_DIR = process.env.WO_U_DIR || process.env.KIMI_MESSENGER_DIR || path.join(os.homedir(), ".kimi-messenger");
-const STORE_FILE = path.join(STORE_DIR, "dm.db");
+const STORE_FILE = path.join(STORE_DIR, "directory.db");
 const API_BASE = process.env.WO_U_API || process.env.KIMI_MESSENGER_API || "http://127.0.0.1:45589";
 
 const PHONE = (process.env.WO_U_COMMAND || process.env.KIMI_MESSENGER_PHONE || "wo-u").trim();
@@ -36,10 +36,10 @@ function envFlag(name, fallback) {
   return !/^(0|false|no|off)$/i.test(raw.trim());
 }
 
-const WITH_CONTACT = envFlag("WO_U_CONTACT", envFlag("KIMI_MESSENGER_CONTACT", true)) && PHONE.length > 0;
+const WITH_REPLY = envFlag("WO_U_CONTACT", envFlag("KIMI_MESSENGER_CONTACT", true)) && PHONE.length > 0;
 
 // ---------------------------------------------------------------------------
-// Wake Adapter: Pluggable host notification
+// Host Wake System
 // ---------------------------------------------------------------------------
 
 function apiToken() {
@@ -170,10 +170,10 @@ function getWakeAdapter() {
 }
 
 // ---------------------------------------------------------------------------
-// Store Primitives
+// Directory Database (Only Stores Aliases)
 // ---------------------------------------------------------------------------
 
-function withStore(fn) {
+function withDirectory(fn) {
   fs.mkdirSync(STORE_DIR, { recursive: true });
 
   const db = new DatabaseSync(STORE_FILE);
@@ -181,44 +181,16 @@ function withStore(fn) {
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA busy_timeout = 5000");
     db.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-        pair         TEXT NOT NULL,
-        sender       TEXT NOT NULL,
-        recipient    TEXT NOT NULL,
-        body         TEXT NOT NULL,
-        created_at   TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_pair_seq ON messages(pair, seq);
-
-      CREATE TABLE IF NOT EXISTS cursors (
-        owner        TEXT NOT NULL,
-        pair         TEXT NOT NULL,
-        last_seq     INTEGER NOT NULL DEFAULT 0,
-        notified_seq INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (owner, pair)
-      );
-
       CREATE TABLE IF NOT EXISTS aliases (
         name       TEXT PRIMARY KEY,
         session_id TEXT NOT NULL UNIQUE,
         updated_at TEXT NOT NULL
       );
     `);
-
-    const cols = db.prepare("PRAGMA table_info(cursors)").all().map((c) => c.name);
-    if (!cols.includes("notified_seq")) {
-      db.exec("ALTER TABLE cursors ADD COLUMN notified_seq INTEGER NOT NULL DEFAULT 0");
-    }
-
     return fn(db);
   } finally {
     db.close();
   }
-}
-
-function pairKey(a, b) {
-  return [a, b].sort().join("|");
 }
 
 function stamp() {
@@ -238,7 +210,7 @@ function sessionMatch(id, ref) {
 function nameLookup() {
   let rows = [];
   try {
-    rows = withStore((db) => db.prepare("SELECT session_id, name FROM aliases").all());
+    rows = withDirectory((db) => db.prepare("SELECT session_id, name FROM aliases").all());
   } catch {
     return () => null;
   }
@@ -289,7 +261,7 @@ export async function register({ sessionId, name }) {
   const wanted = normalizeName(name);
   if (!wanted) throw new Error("Alias cannot be empty");
 
-  return withStore((db) => {
+  return withDirectory((db) => {
     const taken = db.prepare("SELECT session_id FROM aliases WHERE name = ?").get(wanted);
     if (taken && taken.session_id !== session.id) {
       const owner = db.prepare("SELECT name FROM aliases WHERE session_id = ?").get(taken.session_id);
@@ -320,7 +292,7 @@ async function resolveRef(ref) {
   }
 
   const wanted = normalizeName(raw);
-  const hit = withStore((db) =>
+  const hit = withDirectory((db) =>
     db.prepare("SELECT session_id FROM aliases WHERE name = ?").get(wanted));
 
   if (!hit) {
@@ -331,20 +303,19 @@ async function resolveRef(ref) {
 }
 
 export function directory() {
-  return withStore((db) =>
+  return withDirectory((db) =>
     db.prepare("SELECT name, session_id, updated_at FROM aliases ORDER BY name").all());
 }
 
-export function callerCard(caller) {
-  const lines = [`📞 Incoming Call: **${caller}**`];
+export function formatMessage(caller, body) {
+  const lines = [
+    `📞 Incoming message from **${caller}**:`,
+    "",
+    body,
+  ];
 
-  if (WITH_CONTACT) {
-    lines.push(
-      "",
-      `Read: \`${PHONE} read ${caller}\``,
-      `Reply: \`${PHONE} send ${caller} "your message"\``,
-      `Directory: \`${PHONE} book\``,
-    );
+  if (WITH_REPLY) {
+    lines.push("", `Reply: \`${PHONE} send ${caller} "your message"\``);
   }
 
   return lines.join("\n");
@@ -357,145 +328,20 @@ export async function send({ from, to, text }) {
   const [me, peer] = await Promise.all([resolveRef(from), resolveRef(to)]);
   if (me.id === peer.id) throw new Error("Cannot send a message to yourself");
 
-  const pair = pairKey(me.id, peer.id);
-  const at = stamp();
-
-  withStore((db) => {
-    db.prepare(
-      "INSERT INTO messages (pair, sender, recipient, body, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(pair, me.id, peer.id, body, at);
-  });
-
-  const outcome = {
-    delivered: false,
-    to: { id: peer.id, name: peer.name },
-    ...(peer.archived ? { reason: "archived" } : {}),
-  };
-
-  if (peer.archived) return outcome;
+  if (peer.archived) {
+    return { ok: false, to: peer, reason: "archived" };
+  }
 
   const caller = me.name || shortId(me.id);
+  const payload = formatMessage(caller, body);
+
   const adapter = getWakeAdapter();
-  const pushed = await adapter.wake(peer.id, callerCard(caller));
-  if (!pushed.ok) return { ...outcome, reason: pushed.reason };
+  const pushed = await adapter.wake(peer.id, payload);
+  if (!pushed.ok) {
+    return { ok: false, to: peer, reason: pushed.reason };
+  }
 
-  withStore((db) => {
-    const row = db.prepare("SELECT MAX(seq) AS seq FROM messages WHERE pair = ?").get(pair);
-    db.prepare(
-      `INSERT INTO cursors (owner, pair, last_seq, notified_seq) VALUES (?, ?, 0, ?)
-       ON CONFLICT(owner, pair) DO UPDATE SET notified_seq = excluded.notified_seq`,
-    ).run(peer.id, pair, row.seq);
-  });
-
-  return { delivered: true, to: { id: peer.id, name: peer.name } };
-}
-
-export function pending({ self, ack = false }) {
-  const me = String(self ?? "").trim();
-  if (!me) throw new Error("A session id is required");
-
-  const book = new Map(directory().map((r) => [r.session_id, r.name]));
-
-  return withStore((db) => {
-    const rows = db.prepare(
-      `SELECT m.seq, m.pair, m.sender, m.created_at
-         FROM messages m
-         LEFT JOIN cursors c ON c.owner = ? AND c.pair = m.pair
-        WHERE m.recipient = ?
-          AND m.seq > COALESCE(c.notified_seq, 0)
-        ORDER BY m.seq ASC`,
-    ).all(me, me);
-
-    const calls = new Map();
-    for (const row of rows) {
-      const key = row.sender;
-      const cur = calls.get(key);
-      if (cur) {
-        cur.count += 1;
-        cur.last = row.created_at;
-        cur.maxSeq = Math.max(cur.maxSeq, row.seq);
-      } else {
-        calls.set(key, {
-          sessionId: key,
-          name: book.get(key) || null,
-          count: 1,
-          last: row.created_at,
-          maxSeq: row.seq,
-        });
-      }
-    }
-
-    if (ack && rows.length > 0) {
-      const advance = db.prepare(
-        `INSERT INTO cursors (owner, pair, notified_seq) VALUES (?, ?, ?)
-         ON CONFLICT(owner, pair) DO UPDATE SET notified_seq = excluded.notified_seq`,
-      );
-      for (const row of rows) advance.run(me, row.pair, row.seq);
-    }
-
-    return { total: rows.length, calls: [...calls.values()] };
-  });
-}
-
-function resolveOne(ref) {
-  const raw = String(ref ?? "").trim();
-  if (!raw) return null;
-
-  return withStore((db) => {
-    const hit = db.prepare("SELECT session_id FROM aliases WHERE name = ?").get(raw);
-    if (hit) return hit.session_id;
-
-    const senders = db.prepare("SELECT DISTINCT sender AS id FROM messages UNION SELECT DISTINCT recipient AS id FROM messages").all().map((r) => r.id);
-    const matched = senders.filter((id) => sessionMatch(id, raw));
-    if (matched.length === 1) return matched[0];
-
-    if (!raw.startsWith("session_") && senders.includes(`session_${raw}`)) {
-      return `session_${raw}`;
-    }
-
-    return raw;
-  });
-}
-
-export function read({ self, peer, markRead = false, all = false, limit = 20 }) {
-  const me = String(self ?? "").trim();
-  if (!me) throw new Error("A session id is required");
-
-  const book = new Map(directory().map((r) => [r.session_id, r.name]));
-  const only = peer ? resolveOne(peer) : null;
-
-  return withStore((db) => {
-    const whereSeq = all ? "" : "AND m.seq > COALESCE(c.last_seq, 0)";
-    const rows = db.prepare(
-      `SELECT m.seq, m.pair, m.sender, m.body, m.created_at
-         FROM messages m
-         LEFT JOIN cursors c ON c.owner = ? AND c.pair = m.pair
-        WHERE m.recipient = ?
-          ${whereSeq}
-        ORDER BY m.seq ASC`,
-    ).all(me, me);
-
-    const filtered = only ? rows.filter((r) => r.sender === only) : rows;
-    const shown = filtered.slice(-limit);
-
-    if (markRead && shown.length > 0 && !all) {
-      const advance = db.prepare(
-        `INSERT INTO cursors (owner, pair, last_seq) VALUES (?, ?, ?)
-         ON CONFLICT(owner, pair) DO UPDATE SET last_seq = excluded.last_seq`,
-      );
-      for (const m of shown) advance.run(me, m.pair, m.seq);
-    }
-
-    return {
-      total: filtered.length,
-      messages: shown.map((m) => ({
-        from: m.sender,
-        fromName: book.get(m.sender) || null,
-        content: m.body,
-        at: m.created_at,
-      })),
-    };
-  });
+  return { ok: true, to: peer };
 }
 
 export async function roster(opts = {}) {
@@ -510,43 +356,18 @@ export async function roster(opts = {}) {
   }));
 }
 
-export function peers({ self }) {
-  const me = String(self ?? "").trim();
-  if (!me) throw new Error("A session id is required");
-
-  return withStore((db) => db.prepare(
-    `SELECT CASE WHEN sender = ? THEN recipient ELSE sender END AS peer,
-            COUNT(*) AS messages
-       FROM messages WHERE sender = ? OR recipient = ?
-       GROUP BY peer ORDER BY messages DESC`,
-  ).all(me, me, me));
-}
-
-export function inspect() {
+export function doctor() {
   let stat = null;
   try {
     stat = fs.statSync(STORE_FILE);
   } catch {}
 
-  const tables = withStore((db) => {
-    const count = (name) => {
-      try { return db.prepare(`SELECT COUNT(*) AS c FROM ${name}`).get().c; }
-      catch { return null; }
-    };
-    const span = (() => {
-      try {
-        return db.prepare(
-          "SELECT COUNT(*) AS n, MIN(created_at) AS first, MAX(created_at) AS last FROM messages",
-        ).get();
-      } catch { return null; }
-    })();
-    return {
-      messages: count("messages"),
-      cursors: count("cursors"),
-      aliases: count("aliases"),
-      oldest: span?.first ?? null,
-      newest: span?.last ?? null,
-    };
+  const aliasCount = withDirectory((db) => {
+    try {
+      return db.prepare("SELECT COUNT(*) AS c FROM aliases").get().c;
+    } catch {
+      return 0;
+    }
   });
 
   return {
@@ -554,7 +375,7 @@ export function inspect() {
     exists: Boolean(stat),
     bytes: stat?.size ?? 0,
     modifiedAt: stat ? stat.mtime.toISOString() : null,
-    ...tables,
+    aliases: aliasCount,
   };
 }
 
@@ -566,13 +387,9 @@ const USAGE = `Usage:
   wo-u roster                       List active sessions and their aliases
   wo-u name <alias>                 Register an alias for this session
   wo-u whoami                       Show current session identity
-  wo-u send <target> <message>      Call target session (wakes recipient)
-  wo-u pending                      Check caller ID (who called, message count)
-  wo-u read [target] [--all] [--peek] Read message body (--all for history, --peek keeps unread)
-  wo-u peers                        List who you have talked to
+  wo-u send <target> <message>      Call target session (direct delivery)
   wo-u book                         Show directory (alias -> session_id)
-  wo-u doctor                       Inspect store health and message counts
-  wo-u card [alias]                 Preview this phone's incoming call card
+  wo-u doctor                       Inspect directory database status
 
   <target> accepts an alias or session id (unique prefix ok).`;
 
@@ -608,23 +425,11 @@ export async function cli(argv = process.argv.slice(2)) {
       return;
     }
 
-    case "card": {
-      console.log(callerCard(rest[0] || "<caller>"));
-      return;
-    }
-
     case "doctor": {
-      const s = inspect();
-      console.log(`Database  ${s.path}`);
+      const s = doctor();
+      console.log(`Directory ${s.path}`);
       console.log(`          exists=${s.exists}  ${s.bytes} bytes  modified=${s.modifiedAt || "-"}`);
-      console.log(`messages  ${s.messages} rows`);
-      console.log(`cursors   ${s.cursors} rows`);
       console.log(`aliases   ${s.aliases} rows`);
-      if (s.messages === 0) {
-        console.log("\nNotice: 'messages' table is empty. If you just sent a message, check if the database was recreated.");
-      } else {
-        console.log(`\nearliest  ${s.oldest}\nlatest    ${s.newest}`);
-      }
       return;
     }
 
@@ -659,74 +464,20 @@ export async function cli(argv = process.argv.slice(2)) {
         || (() => { throw new Error("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID"); })();
 
       const r = await send({ from: me, to, text });
+      const who = r.to.name || shortId(r.to.id);
 
-      const book = new Map(directory().map((row) => [row.session_id, row.name]));
-      const who = book.get(r.to.id) || r.to.name || r.to.id;
-
-      if (r.delivered) return console.log(`Delivered to ${who} (recipient woken)`);
+      if (r.ok) {
+        console.log(`Sent to ${who} (delivered)`);
+        return;
+      }
 
       const why = {
-        busy: "Recipient is currently busy; message saved for next read",
-        archived: "Recipient session is archived; message saved",
-        offline: "Recipient session is offline; message saved",
+        archived: "Recipient session is archived",
         missing_token: "Cannot locate host API authentication token",
         wake_disabled: "Wake notifications disabled on this host",
       }[r.reason] ?? `Delivery failed: ${r.reason}`;
-      console.log(`Not delivered to ${who} — ${why}`);
-      return;
-    }
-
-    case "pending": {
-      const me = await resolveSelfId();
-      if (!me) return console.log("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
-
-      const { calls, total } = pending({ self: me });
-      if (calls.length === 0) return console.log("(No pending calls)");
-      for (const c of calls) {
-        const who = c.name || shortId(c.sessionId);
-        console.log(`📞 ${who.padEnd(16)} ${c.count} messages  latest ${c.last}`);
-      }
-      console.log(`\n${total} unread message(s) in total`);
-      return;
-    }
-
-    case "read": {
-      const me = await resolveSelfId();
-      if (!me) return console.log("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
-
-      const [who] = rest.filter((x) => !x.startsWith("--"));
-      const isAll = rest.includes("--all");
-      const isPeek = rest.includes("--peek");
-
-      const { messages, total } = read({
-        self: me,
-        peer: who,
-        all: isAll,
-        markRead: !isPeek && !isAll,
-      });
-
-      if (messages.length === 0) return console.log(isAll ? "(No message history)" : "(No unread messages. Use --all to view history)");
-      for (const m of messages) {
-        const who2 = m.fromName || shortId(m.from);
-        console.log(`[${who2}] ${m.at}\n${m.content}\n`);
-      }
-      if (total > messages.length) {
-        console.log(`(${total} messages in total, showing latest ${messages.length})`);
-      }
-      return;
-    }
-
-    case "peers": {
-      const me = await resolveSelfId();
-      if (!me) return console.log("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
-
-      const list = peers({ self: me });
-      if (list.length === 0) return console.log("(No contacts yet)");
-
-      const book = new Map(directory().map((r) => [r.session_id, r.name]));
-      for (const p of list) {
-        console.log(`${(book.get(p.peer) || shortId(p.peer)).padEnd(16)} ${p.peer}  (${p.messages} messages)`);
-      }
+      console.log(`Failed to send to ${who}: ${why}`);
+      process.exitCode = 1;
       return;
     }
 
@@ -736,7 +487,7 @@ export async function cli(argv = process.argv.slice(2)) {
 }
 
 // ---------------------------------------------------------------------------
-// Main Self-Invocation Check
+// Self-Invocation Check
 // ---------------------------------------------------------------------------
 
 const isDirectRun = process.argv[1] && (
