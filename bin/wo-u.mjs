@@ -369,11 +369,10 @@ export async function send({ from, to, text }) {
   const outcome = {
     delivered: false,
     to: { id: peer.id, name: peer.name },
-    ...(peer.busy ? { reason: "busy" } : {}),
     ...(peer.archived ? { reason: "archived" } : {}),
   };
 
-  if (peer.busy || peer.archived) return outcome;
+  if (peer.archived) return outcome;
 
   const caller = me.name || shortId(me.id);
   const adapter = getWakeAdapter();
