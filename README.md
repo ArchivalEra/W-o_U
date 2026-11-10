@@ -113,6 +113,7 @@ All configuration is environment-driven:
 1. **Active memory requirement**: `POST /prompts` only targets sessions currently loaded in Kimi Code memory. Unloaded sessions return `session does not exist`.
 2. **Busy state postponement**: Sessions currently processing a turn are skipped during delivery to avoid prompt interleaving. Messages remain stored in SQLite and are accessible via `wo-u read`.
 3. **Local unencrypted store**: `dm.db` uses standard SQLite permissions. It isolates sessions from cross-talk, but does not provide cryptographic access control against other processes running under the same OS user.
+4. **Desktop UI Transcript Synchronization**: Prompts injected via the local HTTP API are received and executed immediately by the Kimi backend engine (the session status turns busy/working, tools run, and records write to `wire.jsonl`). However, the Electron UI renderer may not optimistically append external prompt bubbles in real time until the user runs `/reload` or switches conversations to re-mount the transcript.
 
 ---
 
