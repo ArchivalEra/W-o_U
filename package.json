@@ -1,0 +1,21 @@
+{
+  "name": "wo-u",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "The first Kimi Code session-level communication tool (without User).",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "wo-u": "bin/wo-u"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "doctor": "bin/wo-u doctor",
+    "roster": "bin/wo-u roster"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

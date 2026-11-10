@@ -1,0 +1,34 @@
+# W/o U — allowlist .gitignore
+#
+# Default-deny: everything is ignored unless explicitly listed below.
+# This keeps the 135MB research leftovers, local databases, credentials,
+# and editor noise out of the repository by construction.
+
+*
+
+# --- Tracked source files ---
+!/.gitignore
+!/LICENSE
+!/README.md
+!/AGENTS.md
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/bin/
+!/bin/wo-u
+!/bin/wo-u.mjs
+
+# --- Never tracked, even if a future rule above would match ---
+# Runtime state (one per phone; must stay local)
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.log
+# Research leftovers / vendored upstream
+/fwens/
+/node_modules/
+# Local overrides
+.env
+.env.*
+!.env.example
