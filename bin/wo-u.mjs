@@ -254,11 +254,46 @@ const KimiHostAdapter = {
         signal: AbortSignal.timeout(5000),
       });
       const body = await apiJson(res);
-      return body?.code === 0
+      const result = body?.code === 0
         ? { ok: true, promptId: body.data?.prompt_id }
         : { ok: false, reason: body?.msg || "rejected" };
+
+      // Direct-inject optimization: if the recipient was busy, the prompt
+      // landed in the queue and would only surface after the active turn
+      // ends. Steer it into the running turn so the call is seen now.
+      if (result.ok && result.promptId) {
+        const steered = await this.steerPending(sessionId, result.promptId);
+        if (steered) result.steered = true;
+      }
+      return result;
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+  },
+
+  /**
+   * Steer a queued prompt into the recipient's active turn.
+   * Idempotent: fails benignly when the prompt is not pending (already
+   * running, or the turn ended and the queue drained on its own).
+   */
+  async steerPending(sessionId, promptId) {
+    const base = await resolveApiBase();
+    const token = apiToken();
+    if (!token) return false;
+    try {
+      const res = await fetch(
+        `${base}/api/v1/sessions/${sessionId}/prompts/${promptId}:steer`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      const body = await apiJson(res);
+      return body?.code === 0 && body?.data?.steered === true;
+    } catch {
+      return false;
     }
   },
 };
