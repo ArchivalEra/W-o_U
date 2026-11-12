@@ -1,6 +1,6 @@
 {
   "name": "wo-u",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "The first Kimi Code session-level communication tool (without User).",
   "engines": {
