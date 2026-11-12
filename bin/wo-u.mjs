@@ -498,7 +498,7 @@ export function formatMessage(caller, body) {
   ];
 
   if (WITH_REPLY) {
-    const reply = PHONE + " send " + caller + ' "your message"';
+    const reply = PHONE + " send " + caller + " 'your message'";
     lines.push("", "Reply: `" + reply + "`");
   }
 
@@ -572,6 +572,7 @@ const USAGE = `Usage:
   wo-u name <alias>                 Register an alias for this session
   wo-u whoami                       Show current session identity
   wo-u send <target> <message>      Call target session (direct delivery)
+  wo-u send <target> --stdin        Read message body from stdin (safe for backticks)
   wo-u book                         Show directory (alias -> session_id)
   wo-u doctor                       Inspect directory database status
 
@@ -662,9 +663,30 @@ function sendFailureText(reason) {
   }[reason] ?? `Delivery failed: ${reason}`;
 }
 
+function readStdinText() {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      resolve(null);
+      return;
+    }
+    let raw = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => resolve(raw));
+    // Never hang the CLI on an open pipe.
+    setTimeout(() => resolve(raw.length > 0 ? raw : null), 1500).unref();
+  });
+}
+
 async function runSendCommand(rest) {
-  const [to, ...words] = rest;
-  const text = words.join(" ");
+  const flags = rest.filter((x) => x === "--stdin");
+  const positional = rest.filter((x) => x !== "--stdin");
+  const [to, ...words] = positional;
+  const inlineText = words.join(" ");
+  const pipedText = flags.includes("--stdin") ? await readStdinText() : null;
+
+  // --stdin wins when both are given; inline remains the default form.
+  const text = flags.includes("--stdin") ? (pipedText ?? "").trim() : inlineText;
   if (!to || !text) {
     console.log(USAGE);
     return;
