@@ -58,61 +58,82 @@ function writeCachedBase(base) {
   } catch {}
 }
 
+function processSocketInodes(pid) {
+  const inodes = new Set();
+  try {
+    for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+      const link = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+      const m = link.match(/^socket:\[(\d+)\]$/);
+      if (m?.[1]) inodes.add(m[1]);
+    }
+  } catch {}
+  return inodes;
+}
+
+const LOOPBACK_IPV4_HEX = "7F000001";
+
+function parseLoopbackPort(localAddress) {
+  const m = localAddress?.match(/^([0-9A-F]+):([0-9A-F]{4})$/);
+  if (!m?.[1] || !m[2]) return null;
+  const hex = m[1];
+  // IPv4 addresses are hex-encoded little-endian inside tcp; tcp6 entries
+  // may embed an IPv4 loopback as ::ffff:127.0.0.1.
+  const isLoopback = hex.length === 8
+    ? hex.match(/../g)?.reverse().join("") === LOOPBACK_IPV4_HEX
+    : hex.toLowerCase().endsWith(LOOPBACK_IPV4_HEX.toLowerCase());
+  return isLoopback ? parseInt(m[2], 16) : null;
+}
+
+function listeningPortsForTable(table, inodeSet) {
+  const found = [];
+  let rows = [];
+  try {
+    rows = fs.readFileSync(table, "utf-8").split("\n");
+  } catch {
+    return found;
+  }
+  for (const line of rows) {
+    const cols = line.trim().split(/\s+/);
+    if (cols.length < 10 || !/^\d+$/.test(cols[9])) continue;
+    if (!inodeSet.has(cols[9])) continue;
+    const port = parseLoopbackPort(cols[1]);
+    if (port !== null) found.push(port);
+  }
+  return found;
+}
+
+/** Is this pid a top-level kimi-code process (not a zygote/renderer child)? */
+function isKimiHostProcess(pid) {
+  let cmdline = "";
+  try {
+    cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8");
+  } catch {
+    return false;
+  }
+  return cmdline.includes("kimi-code") && !cmdline.includes("--type=");
+}
+
+function numericProcEntries() {
+  try {
+    return fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n));
+  } catch {
+    return [];
+  }
+}
+
 function localKimiPorts() {
   const ports = new Set();
-  let pids = [];
-  try {
-    pids = fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n));
-  } catch {
-    return ports;
-  }
-  for (const pid of pids) {
-    let cmdline = "";
-    try {
-      cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!cmdline.includes("kimi-code") || cmdline.includes("--type=")) continue;
-    try {
-      // Collect raw socket inode numbers owned by this process.
-      const inodeSet = new Set();
-      try {
-        for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
-          const link = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
-          const m = link.match(/^socket:\[(\d+)\]$/);
-          if (m?.[1]) inodeSet.add(m[1]);
-        }
-      } catch {}
-      if (inodeSet.size === 0) continue;
-
-      // Match against /proc/net/tcp and tcp6; both tables carry a header row
-      // and store the inode as a bare decimal in column 9.
-      for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
-        let rows = [];
-        try {
-          rows = fs.readFileSync(table, "utf-8").split("\n");
-        } catch {
-          continue;
-        }
-        for (const line of rows) {
-          const cols = line.trim().split(/\s+/);
-          if (cols.length < 10 || !/^\d+$/.test(cols[9])) continue;
-          if (!inodeSet.has(cols[9])) continue;
-          const local = cols[1];
-          const m = local?.match(/^([0-9A-F]+):([0-9A-F]{4})$/);
-          if (!m?.[1] || !m[2]) continue;
-          // IPv4 addresses are hex-encoded little-endian inside tcp; tcp6
-          // entries may embed an IPv4 loopback as ::ffff:127.0.0.1.
-          const hex = m[1];
-          const isLoopback = hex.length === 8
-            ? hex.match(/../g)?.reverse().join("") === "7F000001"
-            : hex.toLowerCase().endsWith("7f000001");
-          if (!isLoopback) continue;
-          ports.add(parseInt(m[2], 16));
-        }
+  for (const pid of numericProcEntries()) {
+    if (!isKimiHostProcess(pid)) continue;
+    const inodeSet = processSocketInodes(pid);
+    if (inodeSet.size === 0) continue;
+    // /proc/net/tcp and tcp6 both carry a header row and store the socket
+    // inode as a bare decimal in column 9.
+    for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      for (const port of listeningPortsForTable(table, inodeSet)) {
+        ports.add(port);
       }
-    } catch {}
+    }
   }
   return ports;
 }
@@ -471,13 +492,14 @@ export function directory() {
 
 export function formatMessage(caller, body) {
   const lines = [
-    `📞 Incoming message from **${caller}**:`,
+    "📞 Incoming message from **" + caller + "**:",
     "",
     body,
   ];
 
   if (WITH_REPLY) {
-    lines.push("", `Reply: \`${PHONE} send ${caller} "your message"\``);
+    const reply = PHONE + " send " + caller + ' "your message"';
+    lines.push("", "Reply: `" + reply + "`");
   }
 
   return lines.join("\n");
@@ -564,88 +586,123 @@ async function resolveSelfId() {
   return mine.length === 1 ? mine[0].id : null;
 }
 
+function requireSelfId() {
+  return resolveSelfId().then((me) => {
+    if (!me) throw new Error("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
+    return me;
+  });
+}
+
+function sessionMark(s) {
+  if (s.archived) return "·";
+  return s.busy ? "●" : "○";
+}
+
+function paddedLabel(s) {
+  return (s.name || "(unnamed)").padEnd(16);
+}
+
+function truncatedTitle(s) {
+  return s.title ? `  "${s.title.slice(0, 24)}"` : "";
+}
+
+async function runRosterCommand() {
+  const list = await roster();
+  if (list.length === 0) {
+    console.log("(No sessions found. Verify server token and host API port)");
+    return;
+  }
+  for (const s of list) {
+    console.log(`${sessionMark(s)} ${paddedLabel(s)} ${s.id}${truncatedTitle(s)}`);
+  }
+  console.log("\n● busy  ○ idle  · archived");
+}
+
+function runBookCommand() {
+  const rows = directory();
+  if (rows.length === 0) {
+    console.log("(Directory is empty. Run 'wo-u name <alias>' to register)");
+    return;
+  }
+  for (const r of rows) console.log(`${r.name.padEnd(16)} ${r.session_id}`);
+}
+
+function runDoctorCommand() {
+  const s = doctor();
+  console.log(`Directory ${s.path}`);
+  console.log(`          exists=${s.exists}  ${s.bytes} bytes  modified=${s.modifiedAt || "-"}`);
+  console.log(`aliases   ${s.aliases} rows`);
+}
+
+async function runWhoamiCommand() {
+  const me = await requireSelfId();
+  const list = await roster({ self: me });
+  const hit = list.find((s) => s.isSelf);
+  const label = hit?.name ? `  (${hit.name})` : "  (unnamed)";
+  console.log(`${me}${label}`);
+  console.log(hit?.cwd || "");
+}
+
+async function runNameCommand(rest) {
+  const wanted = rest.join(" ").trim();
+  if (!wanted) {
+    console.log("Usage: wo-u name <alias>");
+    return;
+  }
+  const me = await requireSelfId();
+  const r = await register({ sessionId: me, name: wanted });
+  console.log(`Registered: ${r.name} -> ${r.sessionId}`);
+}
+
+function sendFailureText(reason) {
+  return {
+    archived: "Recipient session is archived",
+    missing_token: "Cannot locate host API authentication token",
+    wake_disabled: "Wake notifications disabled on this host",
+  }[reason] ?? `Delivery failed: ${reason}`;
+}
+
+async function runSendCommand(rest) {
+  const [to, ...words] = rest;
+  const text = words.join(" ");
+  if (!to || !text) {
+    console.log(USAGE);
+    return;
+  }
+  const me = await requireSelfId();
+  const r = await send({ from: me, to, text });
+  const who = r.to.name || shortId(r.to.id);
+
+  if (r.ok) {
+    console.log(`Sent to ${who} (delivered)`);
+    return;
+  }
+  console.log(`Failed to send to ${who}: ${sendFailureText(r.reason)}`);
+  process.exitCode = 1;
+}
+
+async function runCardCommand(rest) {
+  console.log(formatMessage(rest[0] || "<caller>", "<message body>"));
+}
+
+const COMMANDS = {
+  roster: () => runRosterCommand(),
+  book: () => runBookCommand(),
+  doctor: () => runDoctorCommand(),
+  whoami: () => runWhoamiCommand(),
+  name: (rest) => runNameCommand(rest),
+  send: (rest) => runSendCommand(rest),
+  card: (rest) => runCardCommand(rest),
+};
+
 export async function cli(argv = process.argv.slice(2)) {
   const [cmd, ...rest] = argv;
-
-  switch (cmd) {
-    case "roster": {
-      const list = await roster();
-      if (list.length === 0) return console.log("(No sessions found. Verify server token and host API port)");
-      for (const s of list) {
-        const mark = s.archived ? "·" : s.busy ? "●" : "○";
-        const name = s.name ? s.name.padEnd(16) : "(unnamed)".padEnd(16);
-        console.log(`${mark} ${name} ${s.id}${s.title ? `  "${s.title.slice(0, 24)}"` : ""}`);
-      }
-      console.log("\n● busy  ○ idle  · archived");
-      return;
-    }
-
-    case "book": {
-      const rows = directory();
-      if (rows.length === 0) return console.log("(Directory is empty. Run 'wo-u name <alias>' to register)");
-      for (const r of rows) console.log(`${r.name.padEnd(16)} ${r.session_id}`);
-      return;
-    }
-
-    case "doctor": {
-      const s = doctor();
-      console.log(`Directory ${s.path}`);
-      console.log(`          exists=${s.exists}  ${s.bytes} bytes  modified=${s.modifiedAt || "-"}`);
-      console.log(`aliases   ${s.aliases} rows`);
-      return;
-    }
-
-    case "whoami": {
-      const me = await resolveSelfId();
-      if (!me) return console.log("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
-      const list = await roster({ self: me });
-      const hit = list.find((s) => s.isSelf);
-      console.log(`${me}${hit?.name ? `  (${hit.name})` : "  (unnamed)"}`);
-      console.log(hit?.cwd || "");
-      return;
-    }
-
-    case "name": {
-      const wanted = rest.join(" ").trim();
-      if (!wanted) return console.log("Usage: wo-u name <alias>");
-
-      const me = await resolveSelfId();
-      if (!me) return console.log("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID");
-
-      const r = await register({ sessionId: me, name: wanted });
-      console.log(`Registered: ${r.name} -> ${r.sessionId}`);
-      return;
-    }
-
-    case "send": {
-      const [to, ...words] = rest;
-      const text = words.join(" ");
-      if (!to || !text) return console.log(USAGE);
-
-      const me = (await resolveSelfId())
-        || (() => { throw new Error("Cannot locate current session. Set WO_U_SESSION_ID or KIMI_MESSENGER_SESSION_ID"); })();
-
-      const r = await send({ from: me, to, text });
-      const who = r.to.name || shortId(r.to.id);
-
-      if (r.ok) {
-        console.log(`Sent to ${who} (delivered)`);
-        return;
-      }
-
-      const why = {
-        archived: "Recipient session is archived",
-        missing_token: "Cannot locate host API authentication token",
-        wake_disabled: "Wake notifications disabled on this host",
-      }[r.reason] ?? `Delivery failed: ${r.reason}`;
-      console.log(`Failed to send to ${who}: ${why}`);
-      process.exitCode = 1;
-      return;
-    }
-
-    default:
-      return console.log(USAGE);
+  const handler = COMMANDS[cmd];
+  if (!handler) {
+    console.log(USAGE);
+    return;
   }
+  await handler(rest);
 }
 
 // ---------------------------------------------------------------------------
