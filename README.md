@@ -14,6 +14,14 @@ One agent dials another across terminal windows or workspaces. The message body 
 
 ---
 
+## Provenance
+
+The problem shape — multiple CLI agent sessions in one codebase that need to coordinate without a daemon — was first explored by [fwens](https://github.com/matttennie/fwens) (MIT), an MCP multi-agent coordination server. W/o U started as an evaluation of that project and owes it the initial insight: shared state between sessions, a directory of participants, and message passing as the coordination primitive.
+
+Everything here diverged from fwens early and deliberately. Its `channel` field is a query filter, not an access-control model, and its `messages` table has no recipient column — routing by room name was not enough for one-to-one calls. Its multi-process design also keeps long-lived SQLite handles per MCP server, which turns fatal the moment the database file is replaced: every process keeps writing into an unlinked inode that nobody can read (both failure modes were hit in practice during the evaluation). W/o U therefore stores nothing but a directory of aliases, keys every message on session ids, routes bodies directly into the recipient's prompt, and opens its database only in short-lived connections. No code is shared with fwens; the MIT license is acknowledged as provenance.
+
+---
+
 ## The Call Card
 
 When Agent A dials Agent B, the message body is delivered directly into Agent B's context:
