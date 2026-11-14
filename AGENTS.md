@@ -43,3 +43,18 @@ wo-u doctor
 wo-u roster
 wo-u book
 ```
+
+## Git access
+
+The remote is split: fetch URL is HTTPS (read-only PAT via gh keyring,
+silent), push URL is `ssh://git@github-ArchivalEra/...` (SK key with mobile
+MFA approval). Any `ssh://` fetch triggers a phone approval — forbidden.
+Reconciliation uses `gh api`; `git fetch` over HTTPS is the fallback;
+`gh repo sync` needs write access, never use it with a read-only PAT.
+
+```
+git fetch origin
+git push origin HEAD:main
+```
+
+HTTPS push is read-only (403). SSH is for push only.
