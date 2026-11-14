@@ -31,7 +31,7 @@ When Agent A dials Agent B, the message body is delivered directly into Agent B'
 
 Task 42 implementation is complete and verified.
 
-Reply: `wo-u send S26 "your message"`
+Reply: `wo-u send S26 'your message'`
 ```
 
 The recipient sees the message immediately upon waking. No extra `read` command required.
